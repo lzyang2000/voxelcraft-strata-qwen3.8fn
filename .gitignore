@@ -1,0 +1,14 @@
+# Local reports, videos, and the separate hosted player
+/artifacts/
+/sites/
+/tools/record-demo.cjs
+/tools/demo-scene.js
+
+# Local metadata and credentials
+.DS_Store
+._*
+.env
+.env.*
+*.pem
+*.key
+node_modules/

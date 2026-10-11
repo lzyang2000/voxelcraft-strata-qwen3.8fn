@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>diag</title><link rel="stylesheet" href="../styles.css"></head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud" class="hidden"><div id="crosshair"></div><div id="vignette"></div><div id="water-overlay"></div>
+<div id="health"></div><div id="air"></div><div id="hotbar"></div><div id="held-label"></div><div id="debug"></div>
+<div id="toast"></div><div id="hint"></div></div>
+<div id="loading"><div class="bar"><i id="loading-fill"></i></div><p id="loading-text"></p></div>
+<div id="menu" class="panel hidden"><h1>Voxelcraft</h1><div class="row"><button id="btn-play">Resume</button><button id="btn-new">New World</button></div>
+<div class="row"><button id="btn-save">Save</button><button id="btn-load">Load</button><button id="btn-export">Export .json</button><button id="btn-import">Import .json</button></div>
+<div class="row fields"><label>Mode<select id="mode"><option value="survival">Survival</option><option value="creative">Creative</option></select></label>
+<label>Seed <input id="seed" type="text" spellcheck="false" placeholder="random"></label></div>
+<div class="row fields"><label>Render distance<select id="render-dist"><option value="3">Near</option><option value="4" selected>Medium</option><option value="6">Far</option><option value="8">Ultra</option></select></label>
+<label>Mouse sensitivity <input id="sens" type="range" min="20" max="200" value="100"></label></div>
+<p id="menu-note"></p><input type="file" id="import-file" accept="application/json" class="hidden"></div>
+<div id="inventory" class="panel hidden"><h2>Inventory</h2><div id="inv-main" class="grid"></div><div class="sep"></div><div id="inv-hotbar" class="grid"></div><div class="row"><button id="btn-close-inv">Close (E)</button></div></div>
+<div id="palette" class="panel hidden"><h2>Creative Palette</h2><div id="palette-grid" class="grid"></div><div class="row"><button id="btn-close-palette">Close (E)</button></div></div>
+<div id="crafting" class="panel hidden"><h2>Crafting</h2><p class="sub"></p><div id="craft-list"></div><div class="row"><button id="btn-close-craft">Close (C)</button></div></div>
+<pre id="out" style="position:fixed;left:0;top:0;z-index:99;font-size:11px;background:#000;color:#0f0;margin:0;padding:6px;max-height:100vh;max-width:100vw"></pre>
+<script src="../src/core/constants.js"></script>
+<script src="../src/core/math.js"></script>
+<script src="../src/core/blocks.js"></script>
+<script src="../src/world/world.js"></script>
+<script src="../src/world/generator.js"></script>
+<script src="../src/world/simulation.js"></script>
+<script src="../src/render/textures.js"></script>
+<script src="../src/render/mesher.js"></script>
+<script src="../src/render/renderer.js"></script>
+<script src="../src/game/input.js"></script>
+<script src="../src/game/particles.js"></script>
+<script src="../src/game/inventory.js"></script>
+<script src="../src/game/player.js"></script>
+<script src="../src/game/ui.js"></script>
+<script src="../src/game/save.js"></script>
+<script src="../src/game/game.js"></script>
+<script>
+(function () {
+  var out = document.getElementById('out');
+  var log = [];
+  function say(k, v) { log.push(k + ': ' + (typeof v === 'object' ? JSON.stringify(v) : v)); }
+  var tries = 0;
+  var iv = setInterval(function () {
+    tries++;
+    var g = window.MC && window.MC.game;
+    if (!g || !g.running) {
+      if (tries > 400) { say('FAIL', 'game never reached running state'); out.textContent = log.join('\n'); document.title = 'DIAG_DONE'; clearInterval(iv); }
+      return;
+    }
+    clearInterval(iv);
+    try {
+      var r = g.renderer, gl = r.gl, p = g.player, w = g.world;
+      say('running', true);
+      say('player', [p.position[0].toFixed(2), p.position[1].toFixed(2), p.position[2].toFixed(2)]);
+      say('yaw/pitch', [p.yaw.toFixed(2), p.pitch.toFixed(2)]);
+      say('onGround', p.onGround);
+      say('heightAtPlayer', w.heightAt(Math.floor(p.position[0]), Math.floor(p.position[2])));
+      say('blockUnderFeet', w.getBlock(Math.floor(p.position[0]), Math.floor(p.position[1]) - 1, Math.floor(p.position[2])));
+      say('stats', r.stats);
+      say('hotbar', g.inventory.hotbar.map(function (s) { return s ? s.name + 'x' + s.count : null; }));
+      /* GL error codes */
+      var errs = [], guard = 0;
+      while (guard++ < 20) { var e = gl.getError(); if (e === 0) break; errs.push(e); }
+      say('glErrors', errs);
+      say('glLost', gl.isContextLost());
+      /* mesh of the player's own chunk */
+      var cx = Math.floor(p.position[0] / 16), cz = Math.floor(p.position[2] / 16);
+      var m = MC.Mesher.build(w, cx, cz);
+      say('ownChunk', [cx, cz]);
+      say('ownChunkOpaqueVerts', m.opaque.vertices.length / 7);
+      say('ownChunkFirstVert', Array.prototype.slice.call(m.opaque.vertices, 0, 7));
+      /* clip-space test: where does the chunk centre land on screen? */
+      var proj = MC.M4.perspective(new Float32Array(16), (p.targetFov || MC.C.FOV) * Math.PI / 180, gl.drawingBufferWidth / gl.drawingBufferHeight, MC.C.NEAR, MC.C.FAR);
+      var view = MC.M4.view(new Float32Array(16), p.position[0], p.position[1] + MC.C.EYE_HEIGHT, p.position[2], p.yaw, p.pitch);
+      var vp = new Float32Array(16); MC.M4.multiply(vp, proj, view);
+      var wx = cx * 16 + 8, wy = 30, wz = cz * 16 + 8;
+      var ox = vp[0] * wx + vp[4] * wy + vp[8] * wz + vp[12];
+      var oy = vp[1] * wx + vp[5] * wy + vp[9] * wz + vp[13];
+      var oz = vp[2] * wx + vp[6] * wy + vp[10] * wz + vp[14];
+      var ow = vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15];
+      say('chunkCentreClip', [ox.toFixed(2), oy.toFixed(2), oz.toFixed(2), ow.toFixed(2)]);
+      say('chunkCentreNDC', ow ? [(ox / ow).toFixed(2), (oy / ow).toFixed(2), (oz / ow).toFixed(2)] : null);
+      /* a point 4 blocks in front of the eyes should be near screen centre */
+      var look = p.getLook(), eye = p.getEye();
+      var fx = eye[0] + look[0] * 4, fy = eye[1] + look[1] * 4, fz = eye[2] + look[2] * 4;
+      var qx = vp[0] * fx + vp[4] * fy + vp[8] * fz + vp[12];
+      var qy = vp[1] * fx + vp[5] * fy + vp[9] * fz + vp[13];
+      var qw = vp[3] * fx + vp[7] * fy + vp[11] * fz + vp[15];
+      say('point4aheadNDC', qw ? [(qx / qw).toFixed(3), (qy / qw).toFixed(3), 'w=' + qw.toFixed(2)] : null);
+      /* read the framebuffer back */
+      var px = new Uint8Array(4);
+      var colors = {}, samples = 0, mid = null;
+      var W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+      for (var iy = 0; iy < 12; iy++) {
+        for (var ix = 0; ix < 12; ix++) {
+          var sx = Math.floor((ix + 0.5) * W / 12), sy = Math.floor((iy + 0.5) * H / 12);
+          gl.readPixels(sx, sy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+          var key = px[0] + ',' + px[1] + ',' + px[2];
+          colors[key] = (colors[key] || 0) + 1;
+          if (ix === 6 && iy === 6) mid = key;
+          samples++;
+        }
+      }
+      say('framebufferSamples', samples);
+      say('uniqueColors', Object.keys(colors).length);
+      say('centerPixel', mid);
+      say('topColors', Object.entries(colors).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 6));
+    } catch (err) {
+      say('DIAG_ERROR', err.message);
+      say('stack', (err.stack || '').split('\n').slice(1, 5).join(' | '));
+    }
+    out.textContent = log.join('\n');
+    document.title = 'DIAG_DONE';
+  }, 30);
+})();
+</script>
+</body></html>

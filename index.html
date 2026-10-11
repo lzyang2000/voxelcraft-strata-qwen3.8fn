@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxelcraft &mdash; browser block game</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud" class="hidden">
+  <div id="crosshair"></div>
+  <div id="vignette"></div>
+  <div id="water-overlay"></div>
+  <div id="health"></div>
+  <div id="air"></div>
+  <div id="hotbar"></div>
+  <div id="held-label"></div>
+  <div id="debug"></div>
+  <div id="toast"></div>
+  <div id="hint">Click to capture the mouse &middot; WASD move &middot; Space jump / fly &middot; Left click mine &middot; Right click place &middot; 1-9 hotbar &middot; E inventory &middot; C crafting &middot; F fly &middot; Esc menu</div>
+</div>
+
+<div id="loading"><div class="bar"><i id="loading-fill"></i></div><p id="loading-text">Generating world&hellip;</p></div>
+
+<div id="menu" class="panel hidden">
+  <h1>Voxelcraft</h1>
+  <p class="sub">Mine it. Build it. Watch the sand fall.</p>
+  <div class="row">
+    <button id="btn-play">Resume</button>
+    <button id="btn-new">New World</button>
+  </div>
+  <div class="row">
+    <button id="btn-save">Save</button>
+    <button id="btn-load">Load</button>
+    <button id="btn-export">Export .json</button>
+    <button id="btn-import">Import .json</button>
+  </div>
+  <div class="row fields">
+    <label>Mode
+      <select id="mode">
+        <option value="survival">Survival</option>
+        <option value="creative">Creative</option>
+      </select>
+    </label>
+    <label>Seed <input id="seed" type="text" spellcheck="false" placeholder="random"></label>
+  </div>
+  <div class="row fields">
+    <label>Render distance
+      <select id="render-dist">
+        <option value="3">Near</option>
+        <option value="4" selected>Medium</option>
+        <option value="6">Far</option>
+        <option value="8">Ultra</option>
+      </select>
+    </label>
+    <label>Mouse sensitivity <input id="sens" type="range" min="20" max="200" value="100"></label>
+  </div>
+  <p id="menu-note"></p>
+  <p class="keys">WASD move &middot; Space jump &middot; Shift sprint &middot; Ctrl sneak &middot; F toggle fly &middot; Q drop held stack &middot; 1-9 / wheel hotbar &middot; E inventory &middot; C crafting &middot; F3 debug &middot; F5 save &middot; F9 load &middot; Esc menu</p>
+  <input type="file" id="import-file" accept="application/json" class="hidden">
+</div>
+
+<div id="inventory" class="panel hidden">
+  <h2>Inventory</h2>
+  <div id="inv-main" class="grid"></div>
+  <div class="sep"></div>
+  <div id="inv-hotbar" class="grid"></div>
+  <div class="row"><button id="btn-close-inv">Close (E)</button></div>
+</div>
+
+<div id="palette" class="panel hidden">
+  <h2>Creative Palette</h2>
+  <div id="palette-grid" class="grid"></div>
+  <div class="row"><button id="btn-close-palette">Close (E)</button></div>
+</div>
+
+<div id="crafting" class="panel hidden">
+  <h2>Crafting</h2>
+  <p class="sub">Recipes use what you are carrying. Click one to craft.</p>
+  <div id="craft-list"></div>
+  <div class="row"><button id="btn-close-craft">Close (C)</button></div>
+</div>
+
+<script src="src/core/constants.js"></script>
+<script src="src/core/math.js"></script>
+<script src="src/core/blocks.js"></script>
+<script src="src/world/world.js"></script>
+<script src="src/world/generator.js"></script>
+<script src="src/world/simulation.js"></script>
+<script src="src/render/textures.js"></script>
+<script src="src/render/mesher.js"></script>
+<script src="src/render/renderer.js"></script>
+<script src="src/game/input.js"></script>
+<script src="src/game/particles.js"></script>
+<script src="src/game/inventory.js"></script>
+<script src="src/game/player.js"></script>
+<script src="src/game/ui.js"></script>
+<script src="src/game/save.js"></script>
+<script src="src/game/game.js"></script>
+</body>
+</html>
