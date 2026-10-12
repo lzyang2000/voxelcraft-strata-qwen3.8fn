@@ -8,7 +8,8 @@ ctx.globalThis = ctx;
 vm.createContext(ctx);
 const files = [
   'src/core/constants.js', 'src/core/math.js', 'src/core/blocks.js', 'src/world/world.js',
-  'src/world/generator.js', 'src/render/textures.js', 'src/render/mesher.js'
+  'src/world/generator.js', 'src/render/textures.js', 'src/render/mesher.js',
+  'src/render/renderer.js'
 ];
 for (const f of files) {
   vm.runInContext(fs.readFileSync(path.join(ROOT, f), 'utf8'), ctx, { filename: f });
@@ -261,6 +262,455 @@ function uvUpright(m, tileName) {
 }
 const up = uvUpright(mesh.opaque, 'sand');
 ok('side UV upright (not flipped)', up.bad === 0 && up.good > 0, up);
+
+/* ------------------------- item entities ------------------------------ */
+/* A mined block drops as a mini textured cube that floats and bobs, so the
+ * mesher has to emit a centred, spun, per-block cube with the chunk vertex
+ * layout. These checks pin that contract down. */
+console.log('item entities');
+const DZ = MC.C.DROP_ITEM_SIZE;
+function oneItem(name, spin, pos, size) {
+  return MC.Mesher.buildItems([{
+    pos: pos || [5.5, 8.5, 5.5],
+    size: size === undefined ? DZ : size,
+    spin: spin || 0,
+    blockId: MC.blockIdByName(name)
+  }], w);
+}
+const iGrass = oneItem('grass', 0);
+ok('item mesh shape', !!(iGrass.opaque && iGrass.trans &&
+  iGrass.opaque.vertices && iGrass.opaque.indices), Object.keys(iGrass));
+ok('one item = 24 verts', iGrass.opaque.vertices.length === 24 * 7, iGrass.opaque.vertices.length / 7);
+ok('one item = 36 indices', iGrass.opaque.indices.length === 36, iGrass.opaque.indices.length);
+ok('item verts Float32Array', isType(iGrass.opaque.vertices, 'Float32Array'));
+ok('item idx Uint32Array', isType(iGrass.opaque.indices, 'Uint32Array'));
+ok('opaque bucket empty for an opaque-free item',
+  oneItem('water', 0).opaque.vertices.length === 0 && oneItem('water', 0).opaque.indices.length === 0);
+
+/* several items batch into one mesh: 24/36 each, no shared vertices */
+const many = MC.Mesher.buildItems([
+  { pos: [1.5, 8.5, 1.5], size: DZ, spin: 0.3, blockId: id('stone') },
+  { pos: [2.5, 8.5, 1.5], size: DZ, spin: 1.1, blockId: id('sand') },
+  { pos: [3.5, 8.5, 1.5], size: DZ, spin: 2.4, blockId: id('grass') }
+], w);
+ok('3 opaque items = 72 verts / 108 indices',
+  many.opaque.vertices.length === 72 * 7 && many.opaque.indices.length === 108,
+  [many.opaque.vertices.length / 7, many.opaque.indices.length]);
+{
+  const v = many.opaque.vertices, ix = many.opaque.indices;
+  let maxIdx = 0;
+  for (let i = 0; i < ix.length; i++) if (ix[i] > maxIdx) maxIdx = ix[i];
+  ok('item indices stay inside the mesh', maxIdx === 71, maxIdx);
+  ok('every item owns its own 24 verts (maxIdx = verts-1)', maxIdx + 1 === v.length / 7);
+}
+
+/* centred on pos, never on the block corner: extents are +/- size/2 */
+{
+  const v = iGrass.opaque.vertices;
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let p = 0; p < 24; p++) {
+    for (let k = 0; k < 3; k++) {
+      const q = v[p * 7 + k];
+      if (q < mn[k]) mn[k] = q;
+      if (q > mx[k]) mx[k] = q;
+    }
+  }
+  const pos = [5.5, 8.5, 5.5], half = DZ / 2;
+  let bad = [];
+  for (let k = 0; k < 3; k++) {
+    if (Math.abs(mn[k] - (pos[k] - half)) > 1e-6 || Math.abs(mx[k] - (pos[k] + half)) > 1e-6) {
+      bad.push([k, mn[k], mx[k]]);
+    }
+  }
+  ok('cube is centred on pos (extents = size/2)', bad.length === 0, bad);
+}
+
+/* UVs come from the block's own atlas tiles, per face */
+/* expected atlas-tile bounds for a tile index (v is min/max because atlas
+ * row 0 is the first uploaded row, so the tile's v edges arrive swapped) */
+function expectTile(ti) {
+  const col = ti % COLS, row = (ti / COLS) | 0;
+  const va = ((row + 1) * T - 0.25) / ATLAS_PX, vb = (row * T + 0.25) / ATLAS_PX;
+  return {
+    u0: (col * T + 0.25) / ATLAS_PX, u1: ((col + 1) * T - 0.25) / ATLAS_PX,
+    v0: Math.min(va, vb), v1: Math.max(va, vb)
+  };
+}
+function faceTile(m, f) {
+  const v = m.vertices, us = [], vs = [];
+  for (let p = 0; p * 7 < v.length; p++) {
+    if (v[p * 7 + 6] !== f) continue;
+    us.push(v[p * 7 + 3]); vs.push(v[p * 7 + 4]);
+  }
+  return { n: us.length, u0: Math.min.apply(null, us), u1: Math.max.apply(null, us),
+    v0: Math.min.apply(null, vs), v1: Math.max.apply(null, vs) };
+}
+function tileMatches(m, f, blockName) {
+  const got = faceTile(m, f), want = expectTile(MC.tileFor(MC.blockIdByName(blockName), f));
+  if (got.n !== 4) return 'verts';
+  for (const k of ['u0', 'u1', 'v0', 'v1']) {
+    if (Math.abs(got[k] - want[k]) > 1e-6) return k + ' ' + got[k] + ' != ' + want[k];
+  }
+  return null;
+}
+const gid = id('grass');
+ok('grass item +Y uses the top tile', tileMatches(iGrass.opaque, 2, 'grass') === null,
+  [faceTile(iGrass.opaque, 2), MC.tileFor(gid, 2)]);
+ok('grass item -Y uses the bottom tile', tileMatches(iGrass.opaque, 3, 'grass') === null,
+  [faceTile(iGrass.opaque, 3), MC.tileFor(gid, 3)]);
+{
+  const sides = [0, 1, 4, 5].map(f => tileMatches(iGrass.opaque, f, 'grass')).filter(x => x !== null);
+  ok('grass item 4 sides use the side tile', sides.length === 0, sides);
+  ok('grass top tile really differs from its side tile',
+    MC.tileFor(gid, 2) !== MC.tileFor(gid, 0), [MC.tileFor(gid, 2), MC.tileFor(gid, 0)]);
+}
+ok('stone item sides use the stone tile (not grass)',
+  tileMatches(oneItem('stone', 0).opaque, 0, 'stone') === null,
+  [faceTile(oneItem('stone', 0).opaque, 0), MC.TILE_INDEX['stone']]);
+
+/* aLight uses the documented chunk packing: sky[0.02,1] + raw level * 16 */
+{
+  const v = iGrass.opaque.vertices;
+  let bad = 0, maxSky = 0, maxBlk = 0, faces = new Set();
+  for (let p = 0; p * 7 < v.length; p++) {
+    const L = v[p * 7 + 5];
+    const bc = Math.floor(L / 16), sc = L - bc * 16;
+    if (!(bc >= 0 && bc <= 15) || !(sc >= 0.02 - 1e-6 && sc <= 1 + 1e-6)) bad++;
+    if (sc > maxSky) maxSky = sc;
+    if (bc > maxBlk) maxBlk = bc;
+    faces.add(v[p * 7 + 6]);
+  }
+  ok('item aLight decodes as sky + blk*16', bad === 0, bad);
+  ok('item aFace covers all 6 faces', faces.size === 6, Array.from(faces));
+  /* the item floats in an open-air cell, so it must read full daylight */
+  ok('sunlit item reaches near-full sky channel', maxSky > 0.9, maxSky);
+  ok('no block light in an unlit cell', maxBlk === 0, maxBlk);
+  /* per-face shading still applies (top brighter than bottom) */
+  const lightOf = (m, f) => {
+    const v2 = m.vertices;
+    for (let p = 0; p * 7 < v2.length; p++) if (v2[p * 7 + 6] === f) return v2[p * 7 + 5];
+    return -1;
+  };
+  ok('item faces keep FACE_SHADE (top > bottom)',
+    lightOf(iGrass.opaque, 2) > lightOf(iGrass.opaque, 3),
+    [lightOf(iGrass.opaque, 2), lightOf(iGrass.opaque, 3)]);
+}
+/* an item drifting past a light source picks up the block-light channel */
+{
+  const wlit = new MC.World({ chunksX: 2, chunksZ: 2, seed: 21 });
+  wlit.setBlock(16, 7, 16, id('glowstone'), 0, { silent: true });
+  wlit.relightAll();
+  const lit = MC.Mesher.buildItems([{ pos: [16.5, 7.5, 16.5], size: DZ, spin: 0, blockId: id('stone') }], wlit);
+  const v = lit.opaque.vertices;
+  const L = v[5], bc = Math.floor(L / 16), sc = L - bc * 16;
+  ok('item samples block light from its own cell', bc > 0 && bc <= 15 && sc >= 0.02 && sc <= 1,
+    { L, bc, sc, want: wlit.blockLightAt(16, 7, 16) });
+  ok('item block channel equals world.blockLightAt', bc === wlit.blockLightAt(16, 7, 16),
+    [bc, wlit.blockLightAt(16, 7, 16)]);
+}
+
+/* translucent blocks drop into the blended bucket, everything else opaque */
+{
+  const all = MC.Mesher.buildItems([
+    { pos: [1.5, 8.5, 1.5], size: DZ, spin: 0, blockId: id('water') },
+    { pos: [2.5, 8.5, 1.5], size: DZ, spin: 0, blockId: id('glass') },
+    { pos: [3.5, 8.5, 1.5], size: DZ, spin: 0, blockId: id('stone') },
+    { pos: [4.5, 8.5, 1.5], size: DZ, spin: 0, blockId: id('sand') },
+    { pos: [5.5, 8.5, 1.5], size: DZ, spin: 0, blockId: id('grass') }
+  ], w);
+  ok('water + glass items land in trans',
+    all.trans.vertices.length === 48 * 7 && all.trans.indices.length === 72,
+    [all.trans.vertices.length / 7, all.trans.indices.length]);
+  ok('stone / sand / grass items land in opaque',
+    all.opaque.vertices.length === 72 * 7 && all.opaque.indices.length === 108,
+    [all.opaque.vertices.length / 7, all.opaque.indices.length]);
+  ok('water item uses the water tile',
+    tileMatches(oneItem('water', 0).trans, 2, 'water') === null,
+    faceTile(oneItem('water', 0).trans, 2));
+  ok('glass item uses the glass tile',
+    tileMatches(oneItem('glass', 0).trans, 0, 'glass') === null,
+    faceTile(oneItem('glass', 0).trans, 0));
+}
+
+/* bad items never reach the GPU: skipped, and no NaN in the buffer */
+{
+  const junk = MC.Mesher.buildItems([
+    { pos: [NaN, 8.5, 1.5], size: DZ, spin: 0, blockId: id('stone') },
+    { pos: [1.5, Infinity, 1.5], size: DZ, spin: 0, blockId: id('stone') },
+    { pos: [1.5, 8.5, 1.5], size: NaN, spin: 0, blockId: id('stone') },
+    { pos: [1.5, 8.5, 1.5], size: 0, spin: 0, blockId: id('stone') },
+    { pos: [1.5, 8.5, 1.5], size: DZ, spin: 0, blockId: 0 },
+    { pos: [1.5, 8.5, 1.5], size: DZ, spin: 0, blockId: 9999 },
+    { pos: [1.5, 8.5], size: DZ, spin: 0, blockId: id('stone') },
+    null,
+    { pos: [6.5, 8.5, 6.5], size: DZ, spin: 0.4, blockId: id('stone') }
+  ], w);
+  ok('bad items are skipped, good one survives',
+    junk.opaque.vertices.length === 24 * 7 && junk.opaque.indices.length === 36,
+    [junk.opaque.vertices.length / 7, junk.opaque.indices.length]);
+  let nan = 0;
+  for (const m of [junk.opaque, junk.trans]) {
+    for (let i = 0; i < m.vertices.length; i++) if (!(m.vertices[i] > -Infinity && m.vertices[i] < Infinity)) nan++;
+  }
+  ok('no NaN/Infinity in an item buffer', nan === 0, nan);
+  ok('no items -> empty typed arrays',
+    MC.Mesher.buildItems([], w).opaque.vertices.length === 0 &&
+    isType(MC.Mesher.buildItems([], w).opaque.indices, 'Uint32Array') &&
+    MC.Mesher.buildItems(null, w).trans.indices.length === 0);
+}
+
+/* THE important one: every triangle's geometric normal must point along the
+ * (spun) aFace normal. A winding flip from the Y rotation reads as dot = -1
+ * and would make the cube render inside-out under GL culling. */
+function itemWinding(m, spin) {
+  const v = m.vertices, ix = m.indices;
+  const c = Math.cos(spin), s = Math.sin(spin);
+  let bad = 0, worst = 2;
+  for (let t = 0; t < ix.length; t += 3) {
+    const a = ix[t] * 7, b = ix[t + 1] * 7, d = ix[t + 2] * 7;
+    const e1 = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]];
+    const e2 = [v[d] - v[a], v[d + 1] - v[a + 1], v[d + 2] - v[a + 2]];
+    const n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    const len = Math.hypot(n[0], n[1], n[2]) || 1;
+    const fn = MC.FACE_NORMALS[v[a + 6]];
+    /* the geometry is spun about Y, so the outward normal spins with it */
+    const wx = fn[0] * c + fn[2] * s, wz = -fn[0] * s + fn[2] * c;
+    const dot = (n[0] * wx + n[1] * fn[1] + n[2] * wz) / len;
+    if (dot < 0.999) { bad++; if (dot < worst) worst = dot; }
+  }
+  return { tris: ix.length / 3, bad, worst };
+}
+for (const spin of [0, 0.3, 0.7854, 1.5708, 2.2, 3.1416, 3.9, -0.9, 6.283]) {
+  const st = itemWinding(oneItem('stone', spin).opaque, spin);
+  ok('winding CCW from outside at spin ' + spin, st.bad === 0 && st.tris === 12, st);
+}
+{
+  const tr = itemWinding(oneItem('water', 2.2).trans, 2.2);
+  ok('winding CCW from outside on a trans item', tr.bad === 0 && tr.tris === 12, tr);
+  const mm = itemWinding(many.opaque, 0);
+  ok('multi-item mesh has 36 triangles (3 x 12)', mm.tris === 36, mm);
+}
+/* the spin must actually rotate the cube (a no-op rotation would pass above) */
+{
+  const a = oneItem('stone', 0).opaque.vertices, b = oneItem('stone', 0.7).opaque.vertices;
+  let moved = 0;
+  for (let i = 0; i < 24; i++) if (Math.abs(a[i * 7] - b[i * 7]) > 1e-3 || Math.abs(a[i * 7 + 2] - b[i * 7 + 2]) > 1e-3) moved++;
+  let ySame = 0;
+  for (let i = 0; i < 24; i++) if (Math.abs(a[i * 7 + 1] - b[i * 7 + 1]) < 1e-9) ySame++;
+  ok('spin rotates x/z only (yaw, not tumble)', moved >= 16 && ySame === 24, { moved, ySame });
+}
+
+/* an item outside the voxel grid (thrown hard, or a drop at the world edge)
+ * must still mesh: the light accessors clamp to a number, never undefined. */
+{
+  const oobPos = [-3, w.sizeY + 5, w.sizeZ + 7];
+  const oob = MC.Mesher.buildItems([{ pos: oobPos, size: DZ, spin: 0.6, blockId: id('stone') }], w);
+  ok('out-of-bounds item still meshes (24 verts / 36 idx)',
+    oob.opaque.vertices.length === 24 * 7 && oob.opaque.indices.length === 36,
+    [oob.opaque.vertices.length / 7, oob.opaque.indices.length]);
+  {
+    const v = oob.opaque.vertices;
+    let nan = 0, bad = 0, sample = null;
+    for (let p = 0; p * 7 < v.length; p++) {
+      for (let k = 0; k < 5; k++) {
+        if (!(v[p * 7 + k] > -Infinity && v[p * 7 + k] < Infinity)) nan++;
+      }
+      const L = v[p * 7 + 5];
+      const bc = Math.floor(L / 16), sc = L - bc * 16;
+      if (!(bc >= 0 && bc <= 15) || !(sc >= 0.02 - 1e-6 && sc <= 1 + 1e-6)) bad++;
+      if (!sample) sample = { L, bc, sc };
+    }
+    ok('out-of-bounds item has no NaN vertex', nan === 0, nan);
+    ok('out-of-bounds item light still decodes', bad === 0, sample);
+  }
+  ok('skyAt/blockLightAt return numbers outside the grid',
+    typeof w.skyAt(oobPos[0], oobPos[1], oobPos[2]) === 'number' &&
+    typeof w.blockLightAt(oobPos[0], oobPos[1], oobPos[2]) === 'number' &&
+    typeof w.skyAt(-3, -9, -9) === 'number' &&
+    typeof w.blockLightAt(-3, -9, -9) === 'number',
+    [w.skyAt(oobPos[0], oobPos[1], oobPos[2]), w.blockLightAt(oobPos[0], oobPos[1], oobPos[2])]);
+  const ow = itemWinding(oob.opaque, 0.6);
+  ok('out-of-bounds item winding stays CCW', ow.bad === 0 && ow.tris === 12, ow);
+}
+
+/* ---- live view: the per-frame path must not allocate every frame --------
+ * game.js calls buildItems(list, world, false) once per frame. Snapshot mode
+ * (the default) keeps its private-copy contract so tests and tools can hold a
+ * mesh across later builds; live mode hands back views of the mesher's own
+ * scratch, which the renderer uploads synchronously before the next frame. */
+{
+  const spec = [
+    { pos: [4.5, 9.5, 4.5], size: DZ, spin: 0.4, blockId: id('stone') },
+    { pos: [5.5, 9.5, 4.5], size: DZ, spin: 1.9, blockId: id('grass') },
+    { pos: [6.5, 9.5, 4.5], size: DZ * 0.5, spin: 2.6, blockId: id('glass') }
+  ];
+  const snap = MC.Mesher.buildItems(spec, w);
+  const live = MC.Mesher.buildItems(spec, w, false);
+  function samePart(a, b) {
+    if (a.vertices.length !== b.vertices.length || a.indices.length !== b.indices.length) return false;
+    for (let i = 0; i < a.vertices.length; i++) if (a.vertices[i] !== b.vertices[i]) return false;
+    for (let i = 0; i < a.indices.length; i++) if (a.indices[i] !== b.indices[i]) return false;
+    return true;
+  }
+  ok('live view has the same shape as a snapshot',
+    live.opaque.vertices.length === snap.opaque.vertices.length &&
+    live.opaque.indices.length === snap.opaque.indices.length &&
+    live.trans.vertices.length === snap.trans.vertices.length &&
+    live.trans.indices.length === snap.trans.indices.length,
+    [live.opaque.vertices.length / 7, live.trans.vertices.length / 7]);
+  ok('live view content is identical to the snapshot',
+    samePart(live.opaque, snap.opaque) && samePart(live.trans, snap.trans));
+  ok('live view is still a typed array of the right kind',
+    isType(live.opaque.vertices, 'Float32Array') && isType(live.opaque.indices, 'Uint32Array') &&
+    isType(live.trans.vertices, 'Float32Array') && isType(live.trans.indices, 'Uint32Array'));
+  /* A subarray view sits inside a larger scratch allocation, so its backing
+   * ArrayBuffer is bigger than the view itself. slice() would have produced a
+   * standalone buffer exactly as large as the content. */
+  ok('live view is a view, not a private copy (backing buffer is larger)',
+    live.opaque.vertices.buffer.byteLength > live.opaque.vertices.byteLength &&
+    live.trans.vertices.buffer.byteLength > live.trans.vertices.byteLength,
+    [live.opaque.vertices.buffer.byteLength, live.opaque.vertices.byteLength]);
+
+  /* Repeated live builds must reuse the same backing store: a fresh
+     Float32Array per frame is exactly the regression this guards. */
+  const backs = [];
+  for (let f = 0; f < 40; f++) {
+    const m = MC.Mesher.buildItems(spec, w, false);
+    backs.push([m.opaque.vertices.buffer, m.opaque.indices.buffer,
+                m.trans.vertices.buffer, m.trans.indices.buffer]);
+  }
+  let reused = true;
+  for (let i = 1; i < backs.length; i++) {
+    for (let k = 0; k < 4; k++) if (backs[i][k] !== backs[0][k]) reused = false;
+  }
+  ok('40 live builds reuse the same 4 backing buffers (no per-frame allocation)', reused);
+
+  /* ... and a live result is only valid until the next build, by contract. */
+  const first = MC.Mesher.buildItems([{ pos: [4.5, 9.5, 4.5], size: DZ, spin: 0, blockId: id('stone') }], w, false);
+  const firstLen = first.opaque.vertices.length;
+  MC.Mesher.buildItems([{ pos: [4.5, 9.5, 4.5], size: DZ, spin: 0, blockId: id('stone') },
+                        { pos: [5.5, 9.5, 4.5], size: DZ, spin: 0, blockId: id('stone') }], w, false);
+  ok('a live view is overwritten by the next build (documented contract)',
+    first.opaque.vertices.length !== firstLen ||
+    first.opaque.vertices[0] !== 4.5, first.opaque.vertices.length / 7);
+  ok('an empty live build still yields empty typed arrays',
+    MC.Mesher.buildItems([], w, false).opaque.indices.length === 0);
+}
+
+/* --------------------- renderer: item draw pass ----------------------- */
+/* The item meshes draw with the chunk program through dedicated dynamic
+ * buffers, so the fake GL log must show exactly one extra drawElements per
+ * non-empty bucket and stats.verts must count the item vertices. */
+console.log('renderer item pass');
+{
+  const { createEnv } = require('./fake-dom');
+  const env = createEnv('<canvas id="game"></canvas>');
+  const r = new MC.Renderer(env.canvas);
+  r.setAtlas(atlas);
+  r.resize();
+  const state = {
+    camera: { position: [8.5, 12.5, 8.5], yaw: 0.6, pitch: -0.3, fov: MC.C.FOV },
+    timeOfDay: 0.5, sunDir: [0.2, -0.9, 0.1], particles: null, items: null
+  };
+  r.render(state);
+  const draws0 = env.log.drawElements, verts0 = r.stats.verts;
+  ok('no chunks, no items: no drawElements', draws0 === 0 && verts0 === 0, { draws0, verts0 });
+  ok('sky still draws', env.log.drawArrays >= 1, env.log.drawArrays);
+
+  const one = oneItem('stone', 0.4);
+  state.items = one;
+  r.render(state);
+  ok('opaque items add exactly one drawElements',
+    env.log.drawElements === draws0 + 1, [draws0, env.log.drawElements]);
+  /* stats is reset every frame, so it reports that frame's draw total */
+  ok('stats.verts counts the item vertices',
+    r.stats.verts === verts0 + one.opaque.vertices.length / 7,
+    [verts0, r.stats.verts, one.opaque.vertices.length / 7]);
+  ok('stats.drawCalls counts the item draw', r.stats.drawCalls >= 2, r.stats);
+
+  const d1 = env.log.drawElements;
+  state.items = null;
+  r.render(state);
+  ok('state.items = null draws nothing extra',
+    env.log.drawElements === d1 && r.stats.verts === 0,
+    [d1, env.log.drawElements, r.stats.verts]);
+  state.items = MC.Mesher.buildItems([], w);
+  r.render(state);
+  ok('empty item meshes draw nothing',
+    env.log.drawElements === d1 && r.stats.verts === 0,
+    [d1, env.log.drawElements, r.stats.verts]);
+
+  /* the renderer must accept the live (non-snapshot) mesh the game builds each
+   * frame: it only reads .length and streams the used range, so a view into
+   * the mesher scratch uploads exactly like a private copy. */
+  {
+    const liveBoth = MC.Mesher.buildItems([
+      { pos: [8.5, 12.5, 6.5], size: DZ, spin: 0.2, blockId: id('stone') },
+      { pos: [8.5, 12.5, 6.5], size: DZ, spin: 0.2, blockId: id('water') }
+    ], w, false);
+    const dLive = env.log.drawElements;
+    state.items = liveBoth;
+    r.render(state);
+    ok('a live (scratch-backed) item mesh still draws both buckets',
+      env.log.drawElements === dLive + 2, [dLive, env.log.drawElements]);
+    ok('a live item mesh uploads the same vertex count as a snapshot',
+      r.stats.verts === (liveBoth.opaque.vertices.length + liveBoth.trans.vertices.length) / 7,
+      r.stats.verts);
+  }
+
+  /* re-baseline: the live-view block above added draws of its own */
+  const dSnap = env.log.drawElements;
+  const both = MC.Mesher.buildItems([
+    { pos: [8.5, 12.5, 6.5], size: DZ, spin: 0.2, blockId: id('stone') },
+    { pos: [8.5, 12.5, 6.5], size: DZ, spin: 0.2, blockId: id('water') }
+  ], w);
+  state.items = both;
+  r.render(state);
+  ok('opaque + trans items draw twice',
+    env.log.drawElements === dSnap + 2, [dSnap, env.log.drawElements]);
+  ok('both buckets counted in stats.verts',
+    r.stats.verts === (both.opaque.vertices.length + both.trans.vertices.length) / 7,
+    [r.stats.verts]);
+
+  /* chunksDrawn counts CHUNKS only, and an item draw never depends on a
+   * chunk surviving frustum culling. */
+  r.updateChunk('0,0', MC.Mesher.build(w, 0, 0));
+  const dNear = env.log.drawElements;
+  r.render(state);
+  ok('a visible chunk counts in chunksDrawn', r.stats.chunksDrawn >= 1, r.stats);
+  ok('item draws never inflate chunksDrawn',
+    env.log.drawElements - dNear === r.stats.chunksDrawn + 2,
+    { draws: env.log.drawElements - dNear, chunks: r.stats.chunksDrawn });
+
+  /* park the camera far away and looking the other way: every chunk is culled
+   * (distance + frustum), yet the item cubes must still draw. */
+  state.camera.position = [400.5, 12.5, 400.5];
+  state.camera.yaw = Math.PI;
+  state.camera.pitch = 0;
+  const dFar = env.log.drawElements;
+  r.render(state);
+  ok('every chunk culled: chunksDrawn is 0', r.stats.chunksDrawn === 0, r.stats);
+  ok('items still draw with every chunk culled',
+    env.log.drawElements === dFar + 2, [dFar, env.log.drawElements]);
+  ok('culled frame still counts the item verts',
+    r.stats.verts === (both.opaque.vertices.length + both.trans.vertices.length) / 7, r.stats.verts);
+  state.camera.position = [8.5, 12.5, 8.5];
+  state.camera.yaw = 0.6;
+  state.camera.pitch = -0.3;
+
+  /* the dynamic buffers grow once, then stream the used range */
+  const bd0 = env.log.bufferData;
+  r.render(state);
+  r.render(state);
+  ok('steady-state item frames reuse the buffers (no bufferData churn)',
+    env.log.bufferData === bd0, [bd0, env.log.bufferData]);
+  ok('item buffers exist', !!r._itemVAO && !!r._itemBuf && !!r._itemIdx && r._itemCap > 0,
+    { cap: r._itemCap, idxCap: r._itemIdxCap });
+
+  r.dispose();
+  ok('dispose clears the item GPU refs',
+    r._itemVAO === null || r.gl === null, r.gl);
+}
 
 /* --------------------- camera / view-matrix contract -------------------- */
 /* Regression: MC.M4.view used to store R instead of R^T, which mirrored the

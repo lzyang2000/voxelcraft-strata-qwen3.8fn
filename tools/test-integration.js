@@ -390,6 +390,100 @@ ok('the reloaded world is intact', world2.getBlock(Math.floor(player2.position[0
   game.giveStartingItems();
 }
 
+/* ---------- mined blocks render as floating textured item cubes -------- */
+{
+  const g4 = MC.game, w4 = g4.world, p4 = g4.player, r4 = g4.renderer;
+  g4.drops.length = 0;
+  const px = Math.floor(p4.position[0]), pz = Math.floor(p4.position[2]);
+  const py = Math.floor(p4.position[1]) - 1;
+  for (let dx = -1; dx <= 1; dx++)
+    for (let dz = -1; dz <= 1; dz++) w4.setBlock(px + dx, py, pz + dz, STONE);
+  p4.velocity = [0, 0, 0];
+  p4.position = [px + 0.5, py + 1.05, pz + 0.5];
+  p4.yaw = 0; p4.pitch = -1.45;
+  env.pump(4, 16);
+  ok('the player stands on the block to be mined', w4.getBlock(px, py, pz) === STONE,
+    { cell: [px, py, pz], block: w4.getBlock(px, py, pz) });
+
+  /* Spy on the two ends of the real frame path: game.js builds the item mesh
+   * through MC.Mesher.buildItems and the renderer draws it through
+   * _drawItems. The pooled item array is copied because it is reused. */
+  let built = null;
+  const realBuild = MC.Mesher.buildItems;
+  MC.Mesher.buildItems = function (items, world, snapshot) {
+    /* The game's hot path passes snapshot=false, which hands back a live view
+     * into the mesher scratch. Copy what the assertions read so a later build
+     * cannot overwrite them out from under this test. */
+    const m = realBuild.call(MC.Mesher, items, world, snapshot);
+    if (m.opaque.indices.length || m.trans.indices.length) {
+      built = {
+        n: items.length,
+        pos: items.map(function (q) { return q.pos.slice(); }),
+        size: items.map(function (q) { return q.size; }),
+        mesh: {
+          opaque: {
+            vertices: m.opaque.vertices.slice(),
+            indices: m.opaque.indices.slice()
+          },
+          trans: { vertices: m.trans.vertices.slice(), indices: m.trans.indices.slice() }
+        }
+      };
+    }
+    return m;
+  };
+  let itemDraws = 0;
+  const realDraw = r4._drawItems;
+  r4._drawItems = function (part) { itemDraws++; return realDraw.call(this, part); };
+
+  /* mine through the input path, stopping the pump on the very frame the
+   * block breaks so the drop has not been magnetised into the pack yet */
+  env.canvas.dispatch('mousedown', { button: 0 });
+  let frames = 0;
+  while (w4.getBlock(px, py, pz) === STONE && frames < 400) { env.frame(16); frames++; }
+  env.doc.dispatch('mouseup', { button: 0 });
+
+  ok('mining through the input path broke the block', w4.getBlock(px, py, pz) === 0, frames);
+  ok('the break left exactly one drop entity', g4.drops.length === 1, g4.drops.length);
+  const drop = g4.drops[0];
+  const expected = MC.block(STONE).drop;
+  ok('the drop is the mined block\'s drop item', !!drop && drop.name === expected,
+    { drop: drop && drop.name, expected });
+  ok('the frame built an item mesh for the drop', !!built && built.n === 1, built && built.n);
+  ok('the item mesh is one cube (24 verts / 36 indices)',
+    !!built && built.mesh.opaque.vertices.length === 24 * 7 && built.mesh.opaque.indices.length === 36,
+    built && [built.mesh.opaque.vertices.length / 7, built.mesh.opaque.indices.length]);
+  ok('a stone drop is an opaque item, not a blended one',
+    !!built && built.mesh.trans.indices.length === 0, built && built.mesh.trans.indices.length);
+  ok('the renderer drew the item cube', itemDraws >= 1, itemDraws);
+  if (built && drop) {
+    const ip = built.pos[0];
+    ok('the item renders in the drop\'s cell',
+      Math.floor(ip[0]) === Math.floor(drop.pos[0]) &&
+      Math.floor(ip[1]) === Math.floor(drop.pos[1]) &&
+      Math.floor(ip[2]) === Math.floor(drop.pos[2]), { item: ip, drop: drop.pos });
+    ok('the drop cell is the mined block cell',
+      Math.floor(drop.pos[0]) === px && Math.floor(drop.pos[1]) === py &&
+      Math.floor(drop.pos[2]) === pz, { drop: drop.pos, mined: [px, py, pz] });
+    ok('the item floats above the drop\'s physics position',
+      ip[1] > drop.pos[1] + MC.C.DROP_ITEM_FLOAT * 0.5, [ip[1], drop.pos[1]]);
+    ok('the item pops in from a small size',
+      built.size[0] > 0 && built.size[0] <= MC.C.DROP_ITEM_SIZE, built.size[0]);
+  }
+
+  /* a tool has no block tile, so it must stay visible as a point sprite */
+  g4.drops.length = 0;
+  g4.spawnDrop(px, py, pz, 'wooden_pickaxe', 1);
+  const toolSprites = g4.renderParticles().length;
+  ok('a tool drop still produces a visible sprite', toolSprites >= 1, toolSprites);
+  ok('a tool drop produces no item cube', g4.renderItems().length === 0, g4.renderItems().length);
+
+  MC.Mesher.buildItems = realBuild;
+  r4._drawItems = realDraw;
+  g4.drops.length = 0;
+  env.pump(5, 16);
+  ok('the game keeps running after the item-cube checks', MC.game.running === true);
+}
+
 /* ------------------------------ long soak ------------------------------ */
 let soakErr = null;
 try {

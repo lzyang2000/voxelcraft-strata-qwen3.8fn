@@ -24,6 +24,13 @@
   var tV = new Float32Array(1 << 12), tVn = 0;
   var tI = new Uint32Array(1 << 10), tIn = 0;
 
+  /* Item entities re-mesh every frame, so they get their own scratch: sharing
+   * the chunk arrays would let a buildItems() call clobber a chunk build. */
+  var ioV = new Float32Array(1 << 9), ioVn = 0;
+  var ioI = new Uint32Array(1 << 7), ioIn = 0;
+  var itV = new Float32Array(1 << 8), itVn = 0;
+  var itI = new Uint32Array(1 << 6), itIn = 0;
+
   function growF(a, need) {
     if (a.length >= need) return a;
     var n = a.length;
@@ -275,4 +282,115 @@
       }
     };
   };
+
+  /* ---- item entities: mined blocks drop as mini textured cubes ----------
+   * MC.Mesher.buildItems(items, world) -> same mesh shape as build().
+   *   items: [{ pos: [x,y,z], size, spin, blockId }]
+   * Each item is exactly 24 verts / 36 indices: a small cube centred on pos,
+   * spun about Y, textured from the block's own atlas tiles.
+   * snapshot (default) hands back private copies, so the result survives any
+   * later build/buildItems call. Pass snapshot=false on the per-frame render
+   * path: the result is then a live view into the mesher's own scratch, which
+   * the renderer uploads synchronously before the next frame overwrites it.
+   * That keeps the hot path free of per-frame typed-array allocation. */
+  MC.Mesher.buildItems = function (items, world, snapshot) {
+    var C = MC.C;
+    ioVn = ioIn = itVn = itIn = 0;
+    if (!items || !items.length || !world) return emptyMesh();
+
+    var COLS = C.ATLAS_COLS, TILE = C.ATLAS_TILE_PX;
+    var AW = COLS * TILE;
+    var INSET = 0.25;
+    var uvs = MC.FACE_UVS;
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (!it) continue;
+      var pos = it.pos, size = it.size, id = it.blockId;
+      if (!pos || !(size > 0)) continue;
+      var b = MC.block(id);
+      if (!(id > 0) || !b || b.id !== id) continue;   /* unknown block: no tile */
+      /* a NaN/Infinity pos or size would poison the whole vertex buffer */
+      var px = pos[0], py = pos[1], pz = pos[2];
+      if (!(px > -Infinity && px < Infinity) || !(py > -Infinity && py < Infinity) ||
+          !(pz > -Infinity && pz < Infinity) || !(size < Infinity)) continue;
+
+      var isT = b.pass === 'trans' || MC.isLiquidBlock(id);
+      var V = isT ? itV : ioV, I = isT ? itI : ioI;
+      var vn = isT ? itVn : ioVn, inr = isT ? itIn : ioIn;
+
+      /* one light sample per item: the cell it is floating in. No AO -- a
+       * floating cube has no creases to darken. */
+      var lx = Math.floor(px), ly = Math.floor(py), lz = Math.floor(pz);
+      var skyT = world.skyAt(lx, ly, lz) / 15;
+      var blkRaw = world.blockLightAt(lx, ly, lz);
+
+      var cs = Math.cos(it.spin || 0), sn = Math.sin(it.spin || 0);
+
+      for (var f = 0; f < 6; f++) {
+        var corners = MC.FACES[f].corners;
+
+        if (V.length < (vn + 4) * STRIDE) {
+          V = growF(V, (vn + 4) * STRIDE);
+          if (isT) itV = V; else ioV = V;
+        }
+        if (I.length < inr + 6) {
+          I = growU(I, inr + 6);
+          if (isT) itI = I; else ioI = I;
+        }
+
+        var ti = MC.tileFor(id, f);
+        var col = ti % COLS, row = (ti / COLS) | 0;
+        var u0 = (col * TILE + INSET) / AW;
+        var u1 = ((col + 1) * TILE - INSET) / AW;
+        var v0 = ((row + 1) * TILE - INSET) / AW;    /* tile bottom edge */
+        var v1 = (row * TILE + INSET) / AW;          /* tile top edge    */
+
+        var Ls = skyT * MC.FACE_SHADE[f];
+        if (Ls < 0.02) Ls = 0.02; else if (Ls > 1) Ls = 1;
+        var light = Ls + blkRaw * 16;               /* raw level * 16, as chunks */
+
+        var base = vn;
+        for (var k = 0; k < 4; k++) {
+          var c = corners[k], uv = uvs[k];
+          /* centred on pos (never scaled about the block corner), then spun
+           * about Y. A rotation has determinant +1, so the CCW-from-outside
+           * winding of MC.FACES survives it. */
+          var sx = (c[0] - 0.5) * size, sy = (c[1] - 0.5) * size, sz = (c[2] - 0.5) * size;
+          var p = vn * STRIDE;
+          V[p] = px + sx * cs + sz * sn;
+          V[p + 1] = py + sy;
+          V[p + 2] = pz - sx * sn + sz * cs;
+          V[p + 3] = uv[0] === 0 ? u0 : u1;
+          V[p + 4] = uv[1] === 0 ? v0 : v1;
+          V[p + 5] = light;
+          V[p + 6] = f;
+          vn++;
+        }
+        var idx = MC.FACE_INDICES;
+        var q = inr;
+        for (var m = 0; m < 6; m++) I[q + m] = base + idx[m];
+        inr = q + 6;
+      }
+      if (isT) { itVn = vn; itIn = inr; } else { ioVn = vn; ioIn = inr; }
+    }
+
+    if (snapshot === false) {
+      return {
+        opaque: { vertices: ioV.subarray(0, ioVn * STRIDE), indices: ioI.subarray(0, ioIn) },
+        trans: { vertices: itV.subarray(0, itVn * STRIDE), indices: itI.subarray(0, itIn) }
+      };
+    }
+    return {
+      opaque: {
+        vertices: ioVn ? ioV.slice(0, ioVn * STRIDE) : new Float32Array(0),
+        indices: ioIn ? ioI.slice(0, ioIn) : new Uint32Array(0)
+      },
+      trans: {
+        vertices: itVn ? itV.slice(0, itVn * STRIDE) : new Float32Array(0),
+        indices: itIn ? itI.slice(0, itIn) : new Uint32Array(0)
+      }
+    };
+  };
+
 })(typeof window !== 'undefined' ? window : globalThis);

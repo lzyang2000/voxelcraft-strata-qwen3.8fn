@@ -8,6 +8,8 @@ One-shot means a single user prompt for the final build, including agent reviews
 
 A browser voxel game using plain JavaScript and WebGL2, with mining, crafting, building, water, falling sand, and a day/night cycle.
 
+Mined blocks drop as mini textured cubes of that block that float and bob in the world. That item mesh is rebuilt every frame (spin + bob), so it streams from the mesher's scratch buffers instead of allocating new typed arrays each frame.
+
 ![VoxelCraft gameplay: exploration, mining, crafting, building, water, falling sand, and day/night](images/voxelcraft-demo.gif)
 
 ## Run

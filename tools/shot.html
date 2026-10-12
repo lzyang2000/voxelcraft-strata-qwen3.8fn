@@ -112,7 +112,9 @@
  *   ?view=fp        first person at spawn (default)
  *   ?view=overhead  raised flying camera looking down
  *   ?view=far       raised camera at a shallow angle
- *   ?view=water     teleport to the nearest generated water column
+ *   ?view=water     scripted water-spread + sand-fall demo
+ *   ?view=drop    mine-path item drops rendered as floating mini cubes
+ *   ?view=mine    break a block through the real input path, shoot the cube
  *   ?quiet=1        hide the JSON <pre> so the PNG is just the canvas
  */
 (function () {
@@ -151,6 +153,8 @@
     if (q.quiet) out.style.display = 'none';
     var auditGlow = null;
     var demoAudit = null;
+    var dropAudit = null;
+    var mineAudit = null;
     try {
       var p = g.player, w = g.world;
       var bx = Math.floor(p.position[0]), by = Math.floor(p.position[1]), bz = Math.floor(p.position[2]);
@@ -173,6 +177,103 @@
         p.yaw = Math.atan2(-dx, -dz);
         p.pitch = -Math.atan2(p.position[1] - (ground + 4), Math.sqrt(dx * dx + dz * dz));
       }
+      if (view === 'drop') {
+        /* Mined blocks must show up as miniaturized textured cubes that float
+         * and bob. Spawn five through the game's own drop path, let them land,
+         * then frame the camera on the row of items. The camera sits 3.6 blocks
+         * away so the live rAF loop (which keeps running after these manual
+         * frames) never reaches the 2.4-block pickup magnet. */
+        var g1 = w.heightAt(bx, bz);
+        var names = ['grass', 'sand', 'stone', 'glass', 'log'];
+        for (var di = 0; di < names.length; di++) {
+          g.spawnDrop(bx - 2 + di + 0.5, g1 + 2.5, bz - 1.5, names[di], 1);
+        }
+        p.flying = true;
+        p.position = [bx + 0.5, g1 + 8, bz + 11.5];
+        var t1 = g.last;
+        for (var df = 1; df <= 120; df++) g.frameTick(t1 + df * 16.7);
+        var list = g.renderItems ? g.renderItems() : [];
+        var mesh = (MC.Mesher.buildItems && list.length) ? MC.Mesher.buildItems(list, w) : null;
+        function nanFree(m) {
+          var v = m.vertices, bad = 0;
+          for (var q = 0; q < v.length; q++) if (!(v[q] === v[q])) bad++;
+          return bad;
+        }
+        dropAudit = {
+          drops: g.drops.length,
+          items: list.length,
+          opaqueVerts: mesh ? mesh.opaque.vertices.length / 7 : 0,
+          transVerts: mesh ? mesh.trans.vertices.length / 7 : 0,
+          itemNaN: mesh ? nanFree(mesh.opaque) + nanFree(mesh.trans) : -1,
+          particlesFed: (g.renderParticles() || []).length,
+          particlePool: g.particles.count(),
+          blocks: list.map(function (it) { return MC.block(it.blockId) ? MC.block(it.blockId).name : '?'; }),
+          itemY: list.map(function (it) { return +it.pos[1].toFixed(3); }),
+          dropY: g.drops.map(function (d) { return +d.pos[1].toFixed(3); }),
+          size: list.map(function (it) { return +it.size.toFixed(3); }),
+          spin: list.map(function (it) { return +it.spin.toFixed(3); }),
+          stats: g.renderer.stats
+        };
+        var cy = g1 + 2;
+        p.position = [bx + 0.5, cy + 1.4, bz + 2.1];
+        aimAt(bx + 0.5, cy, bz - 1.5);
+        view = 'drop@' + bx + ',' + (g1 + 2) + ',' + bz;
+      }
+      if (view === 'mine') {
+        /* The real proof of the feature: break a block through the actual
+         * input path (canvas mousedown -> game.updateMining -> breakBlock ->
+         * spawnDrop) and photograph the mini cube that the break leaves
+         * behind. The player is parked far away right after the break so the
+         * 2.4-block pickup magnet cannot vacuum the drop into the pack. */
+        var mx = bx, mz = bz, my = w.heightAt(bx, bz);
+        w.setBlock(mx, my, mz, MC.blockIdByName('stone'));   /* marks light + mesh dirty */
+        p.flying = true;
+        p.position = [mx + 0.5, my + 1.05, mz + 0.5];
+        p.velocity = [0, 0, 0];
+        p.yaw = 0; p.pitch = -1.45;                 /* straight down at the cell */
+        g.frameTick(g.last + 16.7);
+        var canvas = document.getElementById('game');
+        canvas.dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true }));
+        var mf = 0;
+        while (w.getBlock(mx, my, mz) !== 0 && mf < 900) {
+          g.frameTick(g.last + (mf + 1) * 16.7); mf++;
+        }
+        canvas.dispatchEvent(new MouseEvent('mouseup', { button: 0, bubbles: true }));
+        var broke = w.getBlock(mx, my, mz) === 0;
+        var minedDrop = g.drops[g.drops.length - 1] || null;
+        p.position = [mx + 0.5, my + 1.4, mz + 3.1];   /* park outside the magnet */
+        for (var mf2 = 1; mf2 <= 90; mf2++) g.frameTick(g.last + mf2 * 16.7);
+        var mList = g.renderItems ? g.renderItems() : [];
+        var mMesh = (MC.Mesher.buildItems && mList.length) ? MC.Mesher.buildItems(mList, w) : null;
+        var mBad = 0;
+        if (mMesh) {
+          var mv = [mMesh.opaque.vertices, mMesh.trans.vertices];
+          for (var mp = 0; mp < mv.length; mp++) {
+            var arr = mv[mp];
+            for (var mi = 0; mi < arr.length; mi++) if (!(arr[mi] === arr[mi])) mBad++;
+          }
+        }
+        mineAudit = {
+          brokeInFrames: mf,
+          blockGone: broke,
+          minedCell: [mx, my, mz],
+          dropName: minedDrop ? minedDrop.name : null,
+          dropPos: minedDrop ? [+minedDrop.pos[0].toFixed(2), +minedDrop.pos[1].toFixed(2), +minedDrop.pos[2].toFixed(2)] : null,
+          items: mList.length,
+          itemCell: mList.length ? [Math.floor(mList[0].pos[0]), Math.floor(mList[0].pos[1]), Math.floor(mList[0].pos[2])] : null,
+          itemY: mList.length ? +mList[0].pos[1].toFixed(3) : null,
+          hoverOffset: mList.length && minedDrop ? +(mList[0].pos[1] - minedDrop.pos[1]).toFixed(3) : null,
+          size: mList.length ? +mList[0].size.toFixed(3) : null,
+          spin: mList.length ? +mList[0].spin.toFixed(3) : null,
+          itemVerts: mMesh ? (mMesh.opaque.vertices.length + mMesh.trans.vertices.length) / 7 : 0,
+          itemNaN: mMesh ? mBad : -1,
+          spritesFed: (g.renderParticles() || []).length,
+          stats: g.renderer.stats
+        };
+        aimAt(mx + 0.5, my + 0.5, mz + 0.5);
+        view = 'mine@' + mx + ',' + my + ',' + mz;
+      }
+
       var shotTime = 0.34;
       if (view === 'night') {
         /* midnight + two glowstones: checks the sun disc is day-gated and that
@@ -307,6 +408,8 @@
         view: view,
         glowStones: auditGlow,
         fluidDemo: demoAudit,
+        itemDrops: dropAudit,
+        minedBlock: mineAudit,
         timeOfDay: +g.time.toFixed(3),
         warmChunks: g._shotWarm,
         lightAudit: audit,

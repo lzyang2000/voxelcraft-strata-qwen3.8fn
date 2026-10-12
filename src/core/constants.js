@@ -31,6 +31,14 @@
     MAX_HEALTH: 20,
     MAX_AIR: 20,
 
+    /* ---- dropped item entities (mini textured cube that floats + bobs) ---- */
+    DROP_ITEM_SIZE: 0.3,          /* cube edge in blocks */
+    DROP_ITEM_FLOAT: 0.16,        /* hover height above the drop's physics pos */
+    DROP_BOB_AMP: 0.05,           /* bob swing around the hover height */
+    DROP_BOB_SPEED: 2.6,          /* radians/second of the bob */
+    DROP_SPIN_SPEED: 1.7,         /* radians/second of the yaw spin */
+    DROP_POP_RATE: 5,             /* reaches full size 1/DROP_POP_RATE seconds in */
+
     /* ---- simulation ---- */
     SIM_TICK_HZ: 12,
     SIM_RADIUS: 30,

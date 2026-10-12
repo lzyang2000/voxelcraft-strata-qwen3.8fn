@@ -301,6 +301,11 @@
     this._partCap = 0;
     this._partBuf = null;
     this._partVAO = null;
+    this._itemCap = 0;
+    this._itemIdxCap = 0;
+    this._itemBuf = null;
+    this._itemIdx = null;
+    this._itemVAO = null;
     this._lineVAO = null;
     this._lineVBO = null;
     this._skyVAO = null;
@@ -327,6 +332,11 @@
       self._partVAO = null;
       self._partBuf = null;
       self._partCap = 0;
+      self._itemVAO = null;
+      self._itemBuf = null;
+      self._itemIdx = null;
+      self._itemCap = 0;
+      self._itemIdxCap = 0;
       self.chunks.forEach(function (rec) { rec.gpuOpaque = null; rec.gpuTrans = null; });
     };
     this._onRestored = function () {
@@ -392,6 +402,26 @@
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
     gl.enableVertexAttribArray(2);
     gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 24);
+    gl.bindVertexArray(null);
+
+    /* dropped item cubes: one dynamic VAO reused every frame, with the exact
+     * 7-float layout the chunk program expects (aPos/aUV/aLight/aFace). */
+    this._itemVAO = gl.createVertexArray();
+    this._itemBuf = gl.createBuffer();
+    this._itemIdx = gl.createBuffer();
+    this._itemCap = 0;
+    this._itemIdxCap = 0;
+    gl.bindVertexArray(this._itemVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._itemBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 28, 12);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 20);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 28, 24);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this._itemIdx);
     gl.bindVertexArray(null);
 
     gl.enable(gl.DEPTH_TEST);
@@ -566,6 +596,55 @@
     return out;
   }
 
+  /* Chunk-program uniforms that every chunk pass AND the item draws share.
+   * Factored out so the item pass reuses the chunk program without repeating
+   * a dozen calls; alphaTest / shimmer / tint stay per-pass. */
+  MC.Renderer.prototype._setChunkUniforms = function (vp, camX, camY, camZ,
+    time, dayLight, pal, fogStart, fogEnd) {
+    var gl = this.gl, chunk = this.progs.chunk;
+    gl.useProgram(chunk.p);
+    gl.uniformMatrix4fv(chunk.u.uViewProj, false, vp);
+    gl.uniform3f(chunk.u.uCamPos, camX, camY, camZ);
+    gl.uniform1f(chunk.u.uTime, time);
+    gl.uniform1f(chunk.u.uDayLight, dayLight);
+    gl.uniform3f(chunk.u.uSunTint, pal[6], pal[7], pal[8]);
+    gl.uniform3f(chunk.u.uSunDir, pal[11], pal[12], pal[13]);
+    gl.uniform3f(chunk.u.uFogColor, pal[3], pal[4], pal[5]);
+    gl.uniform1f(chunk.u.uFogStart, fogStart);
+    gl.uniform1f(chunk.u.uFogEnd, fogEnd);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
+    gl.uniform1i(chunk.u.uAtlas, 0);
+    return chunk;
+  };
+
+  /* Upload one item mesh into the shared dynamic item buffers and draw it with
+   * the chunk program (whose uniforms the chunk passes already set). Grows the
+   * GPU allocation only when the mesh outgrows it, then streams the used range. */
+  MC.Renderer.prototype._drawItems = function (part) {
+    var gl = this.gl, st = this.stats;
+    var verts = part.vertices, idx = part.indices;
+    if (!this._itemVAO || !verts || !idx || !idx.length) return;
+    gl.bindVertexArray(this._itemVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this._itemBuf);
+    if (this._itemCap < verts.length) {
+      gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+      this._itemCap = verts.length;
+    } else {
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, verts, 0, verts.length);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this._itemIdx);
+    if (this._itemIdxCap < idx.length) {
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.DYNAMIC_DRAW);
+      this._itemIdxCap = idx.length;
+    } else {
+      gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, idx, 0, idx.length);
+    }
+    gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+    st.drawCalls++; st.verts += verts.length / 7;
+  };
+
   MC.Renderer.prototype.render = function (state) {
     if (this.contextLost || this.disposed || !this.gl) return;
     var gl = this.gl, C = MC.C, st = this.stats;
@@ -633,20 +712,8 @@
     gl.depthMask(true);
 
     /* --------------------------- chunk passes ------------------------ */
-    var chunk = this.progs.chunk;
-    gl.useProgram(chunk.p);
-    gl.uniformMatrix4fv(chunk.u.uViewProj, false, vp);
-    gl.uniform3f(chunk.u.uCamPos, camX, camY, camZ);
-    gl.uniform1f(chunk.u.uTime, time);
-    gl.uniform1f(chunk.u.uDayLight, dayLight);
-    gl.uniform3f(chunk.u.uSunTint, pal[6], pal[7], pal[8]);
-    gl.uniform3f(chunk.u.uSunDir, sunX, sunY, sunZ);
-    gl.uniform3f(chunk.u.uFogColor, fogR, fogG, fogB);
-    gl.uniform1f(chunk.u.uFogStart, fogStart);
-    gl.uniform1f(chunk.u.uFogEnd, fogEnd);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
-    gl.uniform1i(chunk.u.uAtlas, 0);
+    var chunk = this._setChunkUniforms(vp, camX, camY, camZ, time, dayLight,
+      pal, fogStart, fogEnd);
 
     var maxDist = C.MAX_MESH_DISTANCE * 16;
     var maxDist2 = maxDist * maxDist;
@@ -681,8 +748,22 @@
     }
     this._sortN = n;
 
+    /* ---- dropped item cubes ------------------------------------------ *
+     * The opaque bucket draws with the chunk uniforms still in place: depth
+     * write on, blend off, cull on -- so items occlude and get occluded by
+     * terrain exactly like blocks do. */
+    var items = state.items, itemTrans = null;
+    if (items) {
+      if (items.opaque && items.opaque.indices && items.opaque.indices.length) {
+        this._drawItems(items.opaque);
+      }
+      if (items.trans && items.trans.indices && items.trans.indices.length) {
+        itemTrans = items.trans;
+      }
+    }
+
     /* ------------- transparent pass: far -> near, no depth write ------ */
-    if (n > 0) {
+    if (n > 0 || itemTrans) {
       /* insertion sort on a fixed pool: no allocation, tiny n */
       for (var i2 = 1; i2 < n; i2++) {
         var cur = pool[i2], j2 = i2 - 1;
@@ -704,6 +785,10 @@
         gl.drawElements(gl.TRIANGLES, gt.count, gl.UNSIGNED_INT, 0);
         st.drawCalls++; st.chunksDrawn++; st.verts += gt.verts;
       }
+      /* glass / water items blend last: they are tiny and sit in front of the
+       * terrain they hover over, and depthMask stays off so they never punch
+       * a hole in the depth buffer. */
+      if (itemTrans) this._drawItems(itemTrans);
       gl.depthMask(true);
       gl.disable(gl.BLEND);
       gl.bindVertexArray(null);
@@ -800,6 +885,9 @@
       if (this._lineVBO) gl.deleteBuffer(this._lineVBO);
       if (this._partVAO) gl.deleteVertexArray(this._partVAO);
       if (this._partBuf) gl.deleteBuffer(this._partBuf);
+      if (this._itemVAO) gl.deleteVertexArray(this._itemVAO);
+      if (this._itemBuf) gl.deleteBuffer(this._itemBuf);
+      if (this._itemIdx) gl.deleteBuffer(this._itemIdx);
     }
     this.progs = null;
     this.atlasTex = null;

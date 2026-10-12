@@ -42,6 +42,8 @@
     this.target = null;
     this.glError = null;
     this._scratchParticles = [];
+    this._scratchItems = [];
+    this._scratchDropSprites = [];
     this._sunDir = [0.3, -0.8, 0.4];
 
     /* MC.Generator.stats() walks every voxel (~1M blocks, ~46 ms), so the
@@ -639,6 +641,13 @@
   Game.prototype.draw = function () {
     var eye = this.player.getEye();
     var bob = this.player.bobPhase || 0;
+    /* Item entities are rebuilt every frame (they spin and bob), so this uses
+     * snapshot=false: the renderer uploads the mesh synchronously inside
+     * render(), so a live view into the mesher's scratch is safe and keeps the
+     * hot path free of per-frame typed-array allocation. */
+    var itemList = this.drops.length ? this.renderItems() : null;
+    var itemMesh = (itemList && itemList.length)
+      ? MC.Mesher.buildItems(itemList, this.world, false) : null;
     var state = {
       camera: {
         position: [eye[0], eye[1] + Math.sin(bob) * 0.045, eye[2]],
@@ -653,6 +662,7 @@
         ? { block: this.target.block, progress: this.mining.total ? MC.Util.clamp(this.mining.progress / this.mining.total, 0, 1) : 0 }
         : null,
       particles: this.renderParticles(),
+      items: itemMesh,
       underwater: !!this.player.headInWater,
       fogStart: this.player.headInWater ? 0.5 : C.FOG_START,
       fogEnd: this.player.headInWater ? 22 : C.FOG_END
@@ -665,10 +675,53 @@
     out.length = 0;
     var list = this.particles.list();
     for (var i = 0; i < list.length; i++) out.push(list[i]);
+    /* Block drops draw as textured cubes (renderItems). A tool or material has
+     * no block tile to texture a cube with, so it keeps the point sprite --
+     * otherwise pressing Q on a pickaxe would drop something invisible. */
+    var sprites = this._scratchDropSprites;
     for (var j = 0; j < this.drops.length; j++) {
       var d = this.drops[j];
-      out.push({ pos: d.pos, color: d.color, size: 0.34 + Math.sin(d.age * 4) * 0.03 });
+      if (MC.blockIdByName(d.name)) continue;
+      var sp = sprites[j];
+      if (!sp) sp = sprites[j] = { pos: [0, 0, 0], color: [0.9, 0.9, 0.9], size: 0.34 };
+      sp.pos[0] = d.pos[0];
+      sp.pos[1] = this.dropDrawY(d);
+      sp.pos[2] = d.pos[2];
+      sp.color[0] = d.color[0]; sp.color[1] = d.color[1]; sp.color[2] = d.color[2];
+      sp.size = 0.34 + Math.sin(d.age * 4) * 0.03;
+      out.push(sp);
     }
+    return out;
+  };
+
+  /* Shared hover + bob, so a cube and a fallback sprite float identically.
+   * Only the DRAWN y moves: physics and pickup keep reading d.pos. */
+  Game.prototype.dropDrawY = function (d) {
+    return d.pos[1] + C.DROP_ITEM_FLOAT +
+      Math.sin(d.age * C.DROP_BOB_SPEED) * C.DROP_BOB_AMP;
+  };
+
+  /* A mined block drops as a mini textured cube that hovers above the ground
+   * and bobs (MC item-entity style). Entries are pooled and reused. */
+  Game.prototype.renderItems = function () {
+    var out = this._scratchItems;
+    var n = 0;
+    for (var i = 0; i < this.drops.length; i++) {
+      var d = this.drops[i];
+      var bid = MC.blockIdByName(d.name);
+      if (!bid) continue;            /* no block tile: renderParticles covers it */
+      var e = out[n];
+      if (!e) e = out[n] = { pos: [0, 0, 0], size: 0, spin: 0, blockId: 0 };
+      e.pos[0] = d.pos[0];
+      e.pos[1] = this.dropDrawY(d);
+      e.pos[2] = d.pos[2];
+      /* pop-in: grows to full size 1/DROP_POP_RATE seconds after the break */
+      e.size = C.DROP_ITEM_SIZE * Math.min(1, d.age * C.DROP_POP_RATE);
+      e.spin = d.age * C.DROP_SPIN_SPEED;
+      e.blockId = bid;
+      n++;
+    }
+    out.length = n;
     return out;
   };
 

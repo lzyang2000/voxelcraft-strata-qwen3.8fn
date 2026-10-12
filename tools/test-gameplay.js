@@ -437,6 +437,148 @@ console.log('particles');
   ok('update on an empty pool is safe', pt.count() === 0);
 }
 
+/* ------------------------------------------------- dropped item entities */
+/* A mined block drops as a mini textured cube that floats and bobs; a tool or
+ * material has no block tile, so it keeps the old point sprite. Both mappings
+ * live in game.js and must never touch the drop's physics position. */
+console.log('drop item entities');
+{
+  /* game.js boots itself off the document, so it gets its own context with a
+   * 'loading' stub document: the module under test is reachable as MC.Game,
+   * and the main context above stays DOM-free (input.js asserts that). */
+  const gctx = { console, Math, Date, JSON, performance: { now: () => Date.now() },
+    document: { readyState: 'loading', addEventListener: () => {}, getElementById: () => null } };
+  gctx.globalThis = gctx;
+  vm.createContext(gctx);
+  let gameErr = null;
+  try {
+    for (const f of ['src/core/constants.js', 'src/core/math.js', 'src/core/blocks.js',
+      'src/game/particles.js', 'src/game/game.js']) {
+      vm.runInContext(fs.readFileSync(path.join(ROOT, f), 'utf8'), gctx, { filename: f });
+    }
+  } catch (e) { gameErr = e; }
+  ok('game.js loads without booting a game', !gameErr, gameErr && gameErr.message);
+  const G = gctx.MC;
+  ok('MC.Game loaded', typeof G.Game === 'function');
+  ok('no game was started', G.game === undefined, G.game);
+  ok('DROP_* constants', C.DROP_ITEM_SIZE === 0.3 && C.DROP_ITEM_FLOAT === 0.16 &&
+    C.DROP_BOB_AMP === 0.05 && C.DROP_BOB_SPEED === 2.6 &&
+    C.DROP_SPIN_SPEED === 1.7 && C.DROP_POP_RATE === 5,
+    [C.DROP_ITEM_SIZE, C.DROP_ITEM_FLOAT, C.DROP_BOB_AMP, C.DROP_BOB_SPEED,
+     C.DROP_SPIN_SPEED, C.DROP_POP_RATE]);
+
+  const g = new G.Game();
+  g.particles = new G.Particles(60);
+  const mkDrop = (name, age) => ({
+    pos: [10.5, 20.45, 30.5], vel: [0, 0, 0], name: name, count: 1,
+    age: age === undefined ? 0 : age, color: [0.5, 0.5, 0.5], picked: false
+  });
+
+  g.drops.length = 0;
+  g.drops.push(mkDrop('stone', 1));
+  const items = g.renderItems();
+  ok('one item entry per block drop', items.length === 1, items.length);
+  ok('item blockId is the dropped block', items[0].blockId === STONE, items[0].blockId);
+  ok('item x/z follow the drop exactly', items[0].pos[0] === 10.5 && items[0].pos[2] === 30.5, items[0].pos);
+  ok('renderItems never moves the drop', g.drops[0].pos[1] === 20.45, g.drops[0].pos);
+
+  /* bob: oscillates around pos.y + DROP_ITEM_FLOAT with amplitude DROP_BOB_AMP */
+  const period = (2 * Math.PI) / C.DROP_BOB_SPEED;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i <= 240; i++) {
+    g.drops[0].age = (i / 240) * period;
+    const y = g.renderItems()[0].pos[1];
+    if (y < lo) lo = y;
+    if (y > hi) hi = y;
+  }
+  const mid = g.drops[0].pos[1] + C.DROP_ITEM_FLOAT;
+  ok('item floats clear of the ground', lo > g.drops[0].pos[1] + 0.05, lo);
+  ok('bob oscillates (max > min)', hi - lo > 1e-6, [lo, hi]);
+  ok('bob is centred on pos.y + DROP_ITEM_FLOAT', Math.abs((lo + hi) / 2 - mid) < 1e-9, [(lo + hi) / 2, mid]);
+  ok('bob amplitude is DROP_BOB_AMP', Math.abs((hi - lo) / 2 - C.DROP_BOB_AMP) < 1e-9, (hi - lo) / 2);
+
+  /* pop-in ramp: 0 -> DROP_ITEM_SIZE over 1/DROP_POP_RATE seconds */
+  g.drops[0].age = 0;
+  ok('size starts at 0', g.renderItems()[0].size === 0, g.renderItems()[0].size);
+  g.drops[0].age = 0.5 / C.DROP_POP_RATE;
+  ok('half size at half the pop time',
+    Math.abs(g.renderItems()[0].size - C.DROP_ITEM_SIZE * 0.5) < 1e-12, g.renderItems()[0].size);
+  g.drops[0].age = 1 / C.DROP_POP_RATE;
+  ok('full size at 1/DROP_POP_RATE',
+    Math.abs(g.renderItems()[0].size - C.DROP_ITEM_SIZE) < 1e-12, g.renderItems()[0].size);
+  g.drops[0].age = 30;
+  ok('size clamps at DROP_ITEM_SIZE', g.renderItems()[0].size === C.DROP_ITEM_SIZE, g.renderItems()[0].size);
+
+  /* spin grows with age (slow yaw) */
+  g.drops[0].age = 0.2;
+  const spinA = g.renderItems()[0].spin;
+  g.drops[0].age = 1.2;
+  const spinB = g.renderItems()[0].spin;
+  ok('spin grows with age', spinB > spinA, [spinA, spinB]);
+  ok('spin equals age * DROP_SPIN_SPEED',
+    Math.abs(spinB - 1.2 * C.DROP_SPIN_SPEED) < 1e-12, [spinB, 1.2 * C.DROP_SPIN_SPEED]);
+
+  /* pooled scratch: no per-frame allocation churn */
+  const poolA = g.renderItems();
+  const poolB = g.renderItems();
+  ok('renderItems reuses one array and its entries', poolA === poolB && poolA[0] === poolB[0]);
+
+  /* particles: a block drop is no longer a point sprite */
+  g.drops.length = 0;
+  g.particles.clear();
+  g.particles.spawnBlockBreak(8, 10, 8, STONE, 12);
+  const pc = g.particles.count();
+  ok('some particles exist to count', pc > 0, pc);
+  g.drops.push(mkDrop('stone', 1));
+  const pl = g.renderParticles();
+  ok('a block drop adds no point sprite', pl.length === pc, [pl.length, pc]);
+  ok('particle count unchanged while a block drop exists', g.particles.count() === pc, g.particles.count());
+  {
+    const real = g.particles.list();
+    ok('every particle entry is a real particle', pl.every((q) => real.indexOf(q) >= 0), pl.length);
+  }
+
+  /* tools / materials have no block tile: they must stay visible as sprites */
+  g.drops.length = 0;
+  g.particles.clear();
+  g.drops.push(mkDrop('wooden_pickaxe', 1));
+  ok('a tool drop emits no item cube', g.renderItems().length === 0, g.renderItems().length);
+  ok('a tool drop still gets a visible sprite', g.renderParticles().length === 1, g.renderParticles().length);
+  {
+    const sp = g.renderParticles()[0];
+    const wantY = 20.45 + C.DROP_ITEM_FLOAT + Math.sin(1 * C.DROP_BOB_SPEED) * C.DROP_BOB_AMP;
+    ok('the fallback sprite floats and bobs like a cube', Math.abs(sp.pos[1] - wantY) < 1e-12, [sp.pos[1], wantY]);
+    ok('the fallback sprite keeps the drop colour', sp.color[0] === 0.5 && sp.color[2] === 0.5, sp.color);
+    ok('the fallback sprite keeps the old size behaviour',
+      sp.size > 0.3 && sp.size < 0.4, sp.size);
+    ok('the fallback sprite does not move the drop', g.drops[0].pos[1] === 20.45, g.drops[0].pos);
+  }
+
+  /* both kinds at once: the two counts stay separated */
+  g.drops.length = 0;
+  g.particles.clear();
+  g.particles.spawnBlockBreak(8, 10, 8, STONE, 12);
+  const pc2 = g.particles.count();
+  g.drops.push(mkDrop('stone', 1), mkDrop('log', 2),
+    mkDrop('wooden_pickaxe', 1), mkDrop('iron_axe', 0.5));
+  ok('2 block drops -> 2 item cubes', g.renderItems().length === 2, g.renderItems().length);
+  ok('2 block drops + 2 tools -> particles + 2 sprites',
+    g.renderParticles().length === pc2 + 2, [g.renderParticles().length, pc2]);
+  {
+    const mixed = g.renderItems();
+    ok('the item list holds only the block drops',
+      mixed.every((e) => e.blockId !== 0) &&
+      mixed[0].blockId === MC.blockIdByName('stone') &&
+      mixed[1].blockId === MC.blockIdByName('log'),
+      mixed.map((e) => e.blockId));
+  }
+  g.drops.length = 0;
+  g.particles.clear();
+  ok('clearing drops empties both lists',
+    g.renderItems().length === 0 && g.renderParticles().length === 0,
+    [g.renderItems().length, g.renderParticles().length]);
+}
+
 /* -------------------------------------------------------------------- save */
 console.log('save');
 {
