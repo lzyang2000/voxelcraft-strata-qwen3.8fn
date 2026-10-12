@@ -1,5 +1,7 @@
 # VoxelCraft
 
+[Link to game playable in browser](https://lzyang2000.github.io/voxelcraft-strata-qwen3.8fn/)
+
 **One-shot build · 11h 9m · 8 Qwen agents · 100.74M tokens processed · 881,597 output tokens.**
 
 Built with **Qwen 3.8 Flash Next** in Codex.
